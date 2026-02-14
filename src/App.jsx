@@ -580,7 +580,7 @@ Target tone: [exact phrases from TARGET that are OOC or tone issues, or leave em
         <div className="flex items-center gap-2">
           <Sparkles className="text-blue-500 w-5 h-5" />
           <h1 className="text-lg font-bold tracking-tight text-gray-900 dark:text-white flex items-center gap-0">
-            ToneCheck <span className="text-gray-400 dark:text-gray-500 mx-2 font-light">|</span> <span className="text-base font-medium text-gray-700 dark:text-gray-300">同调</span> <span className="text-xs text-gray-500 dark:text-gray-400 font-medium px-2 py-0.5 bg-gray-200 dark:bg-gray-800 rounded-full ml-2">v1.9</span>
+            ToneCheck <span className="text-gray-400 dark:text-gray-500 mx-2 font-light">|</span> <span className="text-base font-medium text-gray-700 dark:text-gray-300">同调</span> <span className="text-xs text-gray-500 dark:text-gray-400 font-medium px-2 py-0.5 bg-gray-200 dark:bg-gray-800 rounded-full ml-2">v1.0</span>
           </h1>
         </div>
         <div className="flex items-center gap-1">
