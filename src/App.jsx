@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { Settings, Check, AlertCircle, Loader2, Sparkles, Sun, Moon, Save, Trash2, Clock, X } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { Settings, Check, AlertCircle, Loader2, Sparkles, Sun, Moon, Save, Trash2, Clock, X, Download, Upload, ArrowLeftRight } from 'lucide-react';
 
 const DEFAULT_PERSONAS = [
   { id: 'Grumpy Dwarf', name: 'Grumpy Dwarf', description: 'A grumpy, rude dwarf who uses slang and hates formal language.' },
@@ -70,13 +70,104 @@ function saveProviderSettings(provider, baseUrl, modelName) {
 function parseResultContent(content) {
   if (content == null || typeof content !== 'string') return { tierLine: '', body: '' };
   const trimmed = content.trim();
-  if (!trimmed) return { tierLine: '', body: '' };
+  if (!trimmed) return { tierLine: trimmed, body: '' };
   const firstNewline = trimmed.indexOf('\n');
   if (firstNewline === -1) return { tierLine: trimmed, body: '' };
   return {
     tierLine: trimmed.slice(0, firstNewline).trim(),
     body: trimmed.slice(firstNewline + 1).trim(),
   };
+}
+
+/** Escape special regex characters in a string for use in RegExp. */
+function escapeRegex(s) {
+  if (s == null || typeof s !== 'string') return '';
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Parse the "Highlighted Phrases" block from full AI response.
+ * Expected format (at end of response):
+ * ---
+ * HIGHLIGHTS
+ * Source errors: phrase1|phrase2
+ * Target errors: phrase1|phrase2
+ * Source tone: phrase1|phrase2
+ * Target tone: phrase1|phrase2
+ * ---
+ * Returns { sourceErrors, targetErrors, sourceTone, targetTone } (arrays of non-empty strings).
+ */
+function parseHighlightedPhrases(fullContent) {
+  const empty = { sourceErrors: [], targetErrors: [], sourceTone: [], targetTone: [] };
+  if (fullContent == null || typeof fullContent !== 'string') return empty;
+  const match = fullContent.match(/---\s*HIGHLIGHTS\s*Source errors:\s*([\s\S]*?)\s*Target errors:\s*([\s\S]*?)\s*Source tone:\s*([\s\S]*?)\s*Target tone:\s*([\s\S]*?)\s*---/i);
+  if (!match) return empty;
+  const splitPipe = (raw) =>
+    (raw || '')
+      .split('|')
+      .map((p) => p.trim())
+      .filter(Boolean);
+  return {
+    sourceErrors: splitPipe(match[1].trim()),
+    targetErrors: splitPipe(match[2].trim()),
+    sourceTone: splitPipe(match[3].trim()),
+    targetTone: splitPipe(match[4].trim()),
+  };
+}
+
+/**
+ * Wrap problematic phrases in text with highlight segments for React.
+ * Returns array of string | { type: 'error'|'tone', text: string }.
+ * Longer phrases are applied first to avoid partial overlaps.
+ */
+function buildHighlightSegments(text, errorPhrases, tonePhrases) {
+  if (!text || typeof text !== 'string') return [];
+  const ranges = []; // { start, end, type }
+  const addMatches = (phrases, type) => {
+    const seen = new Set();
+    phrases.forEach((phrase) => {
+      if (!phrase || seen.has(phrase)) return;
+      seen.add(phrase);
+      const escaped = escapeRegex(phrase);
+      if (!escaped) return;
+      const re = new RegExp(escaped, 'g');
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        ranges.push({ start: m.index, end: m.index + m[0].length, type });
+      }
+    });
+  };
+  addMatches(errorPhrases, 'error');
+  addMatches(tonePhrases, 'tone');
+  ranges.sort((a, b) => a.start - b.start);
+  const merged = [];
+  for (const r of ranges) {
+    const last = merged[merged.length - 1];
+    if (last && r.start < last.end) {
+      if (r.type === 'error' && last.type !== 'error') {
+        last.end = r.start;
+        if (last.end <= last.start) merged.pop();
+        merged.push({ ...r });
+      } else if (r.type === 'error' && last.type === 'error') {
+        // skip duplicate error overlap
+      } else if (r.type === 'tone' && last.type === 'tone') {
+        last.end = Math.max(last.end, r.end);
+      }
+      // tone overlapping with error: skip tone
+      continue;
+    }
+    merged.push({ ...r });
+  }
+  const filtered = merged.filter((m) => m.end > m.start);
+  const segments = [];
+  let pos = 0;
+  for (const { start, end, type } of filtered) {
+    if (start > pos) segments.push(text.slice(pos, start));
+    segments.push({ type, text: text.slice(start, end) });
+    pos = end;
+  }
+  if (pos < text.length) segments.push(text.slice(pos));
+  return segments;
 }
 
 // Bilingual / language-agnostic labels
@@ -100,6 +191,14 @@ const t = {
   apiKeyHint: 'Key is stored in your browser\'s LocalStorage. 密钥保存在浏览器本地。',
   sourcePlaceholder: 'Enter source text... 输入原文…',
   translationPlaceholder: 'Enter translation... 输入译文…',
+  langDirectionEnZh: 'English ➡ Chinese',
+  langDirectionZhEn: 'Chinese ➡ English',
+  langDirectionNotice: '⚡ Optimized for En-Zh Game Localization. | 本工具专为英汉游戏本地化打造。',
+  sourcePlaceholderEn: 'Enter English source... 输入英文原文…',
+  sourcePlaceholderZh: 'Enter Chinese source... 输入中文原文…',
+  translationPlaceholderEn: 'Enter Chinese translation... 输入中文译文…',
+  translationPlaceholderZh: 'Enter English translation... 输入英文译文…',
+  swapLabel: 'Swap 交换',
   personaPlaceholder: 'Persona description... 人设描述…',
   savePersonaPrompt: '为人设取个名字 Name for this persona:',
   errorNoApiKey: '请先点击右上角设置图标，填入 API Key Please add your API Key in Settings.',
@@ -113,6 +212,12 @@ const t = {
   baseUrl: 'Base URL',
   modelName: 'Model 模型',
   disclaimer: 'AI-generated content. For reference only. | AI生成内容，结果仅供参考，请结合专业判断。',
+  visualPreview: 'Visual Preview 高亮预览',
+  sourcePreview: 'Source 原文',
+  targetPreview: 'Target 译文',
+  personaCacheWarning: '⚠️ 提醒：自定义人设存储在浏览器缓存中，清理缓存会导致数据丢失。 | Note: Custom personas are stored in browser cache; clearing it will result in data loss.',
+  exportPersonas: 'Export Personas 导出人设',
+  importPersonas: 'Import Personas 导入人设',
 };
 
 const TIER_BADGE = { s: '🏆 信达雅', a: '✨ 注入灵魂', b: '🤔 差点意思', c: '🤡 OOC', d: '💀 致命' };
@@ -145,6 +250,7 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [theme, setTheme] = useState('light');
+  const [langDirection, setLangDirection] = useState('en-zh');
   const [sourceText, setSourceText] = useState('');
   const [targetText, setTargetText] = useState('');
   const [persona, setPersona] = useState(DEFAULT_PERSONAS[0].id);
@@ -153,12 +259,17 @@ export default function App() {
   const [history, setHistory] = useState([]);
   const [resultTierLine, setResultTierLine] = useState('');
   const [resultBody, setResultBody] = useState('');
+  const [highlightSourceErrors, setHighlightSourceErrors] = useState([]);
+  const [highlightSourceTone, setHighlightSourceTone] = useState([]);
+  const [highlightTargetErrors, setHighlightTargetErrors] = useState([]);
+  const [highlightTargetTone, setHighlightTargetTone] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
   const [provider, setProvider] = useState('deepseek');
   const [baseUrl, setBaseUrl] = useState(PROVIDERS.deepseek.baseUrl);
   const [modelName, setModelName] = useState(PROVIDERS.deepseek.model);
+  const importPersonasInputRef = useRef(null);
 
   useEffect(() => {
     const stored = localStorage.getItem('theme');
@@ -238,6 +349,54 @@ export default function App() {
     setShowSettings(false);
   };
 
+  const handleExportPersonas = () => {
+    const blob = new Blob([JSON.stringify(savedPersonas, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'personas_backup.json';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleSwap = () => {
+    setSourceText((prev) => targetText);
+    setTargetText((prev) => sourceText);
+    setLangDirection((prev) => (prev === 'en-zh' ? 'zh-en' : 'en-zh'));
+  };
+
+  const handleImportPersonas = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const raw = reader.result;
+        if (typeof raw !== 'string') return;
+        const parsed = JSON.parse(raw);
+        const list = Array.isArray(parsed) ? parsed : [];
+        const normalized = list
+          .filter((p) => p && typeof p === 'object' && (p.name || p.description))
+          .map((p, i) => ({
+            id: `saved_${Date.now()}_${i}`,
+            name: typeof p.name === 'string' ? p.name.trim() || 'Imported' : 'Imported',
+            description: typeof p.description === 'string' ? p.description : '',
+          }));
+        const existingKeys = new Set(savedPersonas.map((p) => `${p.name}\n${p.description}`));
+        const toAdd = normalized.filter((p) => !existingKeys.has(`${p.name}\n${p.description}`));
+        if (toAdd.length === 0) return;
+        const next = [...savedPersonas, ...toAdd];
+        setSavedPersonas(next);
+        saveSavedPersonas(next);
+      } catch {
+        setError('Invalid personas file. 人设文件格式无效。');
+      }
+      e.target.value = '';
+    };
+    reader.readAsText(file);
+    if (importPersonasInputRef.current) importPersonasInputRef.current.value = '';
+  };
+
   const getTierFromResult = (text) => {
     if (!text || typeof text !== 'string') return null;
     const s = text.trim();
@@ -249,7 +408,7 @@ export default function App() {
     return null;
   };
 
-  const addToHistory = (source, target, personaId, personaDescription, fullResult, tierKey) => {
+  const addToHistory = (source, target, personaId, personaDescription, fullResult, tierKey, highlights = null) => {
     const item = {
       id: `h_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       timestamp: Date.now(),
@@ -259,6 +418,10 @@ export default function App() {
       personaDesc: personaDescription,
       result: fullResult,
       tier: tierKey,
+      highlightSourceErrors: highlights?.sourceErrors ?? [],
+      highlightSourceTone: highlights?.sourceTone ?? [],
+      highlightTargetErrors: highlights?.targetErrors ?? [],
+      highlightTargetTone: highlights?.targetTone ?? [],
     };
     setHistory((prev) => {
       const next = [item, ...prev].slice(0, MAX_HISTORY);
@@ -281,6 +444,10 @@ export default function App() {
     const { tierLine, body } = parseResultContent(full);
     setResultTierLine(tierLine);
     setResultBody(body);
+    setHighlightSourceErrors(item.highlightSourceErrors ?? []);
+    setHighlightSourceTone(item.highlightSourceTone ?? []);
+    setHighlightTargetErrors(item.highlightTargetErrors ?? []);
+    setHighlightTargetTone(item.highlightTargetTone ?? []);
     setShowHistory(false);
   };
 
@@ -293,6 +460,10 @@ export default function App() {
     setError('');
     setResultTierLine('');
     setResultBody('');
+    setHighlightSourceErrors([]);
+    setHighlightSourceTone([]);
+    setHighlightTargetErrors([]);
+    setHighlightTargetTone([]);
 
     const url = baseUrl.replace(/\/$/, '') + '/chat/completions';
 
@@ -308,7 +479,11 @@ export default function App() {
           messages: [
             {
               role: 'system',
-              content: `You are a strict Game LQA Expert. Evaluate the user's translation for meaning accuracy and character tone, then assign exactly one tier.
+              content: `You are a strict Game LQA Expert. Evaluate the user's translation for meaning accuracy and character tone, then assign exactly one tier. You MUST also identify the exact phrases that are problematic so they can be highlighted.
+
+${langDirection === 'en-zh'
+  ? 'Language direction: English → Chinese (Game Loc). Focus on English-to-Chinese errors: specifically 翻译腔 (translationese), mistranslations, and failing to capture the source nuance in Chinese.'
+  : 'Language direction: Chinese → English. Focus on Chinese-to-English errors: specifically Chinglish, grammar issues, and natural phrasing in English.'}
 
 Grading rules (use exactly this logic):
 
@@ -325,7 +500,21 @@ Output format (strictly follow):
 (New line)
 Reasoning: ... (brief evaluation in Chinese)
 (New line)
-Suggestions: ... (only if needed; omit if no changes suggested)`,
+Suggestions: ... (only if needed; omit if no changes suggested)
+
+At the END of your response, you MUST include a "Highlighted Phrases" block so the tool can highlight problematic text. Copy the EXACT phrases from the user's Source and Target (character-for-character). Use | to separate multiple phrases on the same line. Use this exact block:
+
+---
+HIGHLIGHTS
+Source errors: [exact phrases from SOURCE that correspond to mistranslation/wrong meaning, or leave empty]
+Target errors: [exact phrases from TARGET that are wrong/mistranslated, or leave empty]
+Source tone: [exact phrases from SOURCE that correspond to tone issues, or leave empty]
+Target tone: [exact phrases from TARGET that are OOC or tone issues, or leave empty]
+---
+
+- "errors" = meaning errors, mistranslation, hallucination (Tier D). Use exact substring from user input.
+- "tone" = OOC or flat tone issues (Tier B/C). Use exact substring from user input.
+- If no phrase to highlight, write nothing after the colon (e.g. "Source errors: ").`,
             },
             {
               role: 'user',
@@ -339,13 +528,20 @@ Suggestions: ... (only if needed; omit if no changes suggested)`,
       const data = await response.json();
       if (data.error) throw new Error(data.error.message);
       const content = data.choices[0].message.content ?? '';
-      const { tierLine, body } = parseResultContent(content);
+      const fullContent = content.trim();
+      const { tierLine, body: rawBody } = parseResultContent(fullContent);
+      const highlights = parseHighlightedPhrases(fullContent);
+      const bodyForDisplay = rawBody.replace(/\s*---\s*HIGHLIGHTS[\s\S]*?---\s*$/i, '').trim();
       setResultTierLine(tierLine);
-      setResultBody(body);
+      setResultBody(bodyForDisplay);
+      setHighlightSourceErrors(highlights.sourceErrors);
+      setHighlightSourceTone(highlights.sourceTone);
+      setHighlightTargetErrors(highlights.targetErrors);
+      setHighlightTargetTone(highlights.targetTone);
       const tierKey = getTierFromResult(tierLine);
       if (tierKey != null) {
-        const fullContent = body ? `${tierLine}\n${body}` : tierLine;
-        addToHistory(sourceText, targetText, persona, personaDesc, fullContent, tierKey);
+        const fullResult = bodyForDisplay ? `${tierLine}\n${bodyForDisplay}` : tierLine;
+        addToHistory(sourceText, targetText, persona, personaDesc, fullResult, tierKey, highlights);
       }
     } catch (err) {
       setError(err.message || 'Something went wrong');
@@ -383,8 +579,8 @@ Suggestions: ... (only if needed; omit if no changes suggested)`,
       <header className="border-b border-gray-200 dark:border-gray-800 h-16 flex justify-between items-center px-6 bg-white/80 dark:bg-gray-900/50 backdrop-blur sticky top-0 z-10">
         <div className="flex items-center gap-2">
           <Sparkles className="text-blue-500 w-5 h-5" />
-          <h1 className="text-lg font-bold tracking-tight text-gray-900 dark:text-white">
-            ToneCheck <span className="text-xs text-gray-500 dark:text-gray-400 font-medium px-2 py-0.5 bg-gray-200 dark:bg-gray-800 rounded-full">v1.6</span>
+          <h1 className="text-lg font-bold tracking-tight text-gray-900 dark:text-white flex items-center gap-0">
+            ToneCheck <span className="text-gray-400 dark:text-gray-500 mx-2 font-light">|</span> <span className="text-base font-medium text-gray-700 dark:text-gray-300">同调</span> <span className="text-xs text-gray-500 dark:text-gray-400 font-medium px-2 py-0.5 bg-gray-200 dark:bg-gray-800 rounded-full ml-2">v1.9</span>
           </h1>
         </div>
         <div className="flex items-center gap-1">
@@ -402,24 +598,83 @@ Suggestions: ... (only if needed; omit if no changes suggested)`,
 
       <main className="max-w-6xl mx-auto p-6 grid grid-cols-1 lg:grid-cols-2 gap-8">
         <div className="flex flex-col gap-6">
+          <div className="space-y-1.5">
+            <label className="block text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider ml-1">Language Direction 语言方向</label>
+            <select
+              className="w-full bg-white dark:bg-gray-900/50 border border-gray-200 dark:border-gray-800 rounded-xl px-3 py-2.5 text-sm focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 focus:outline-none text-gray-900 dark:text-gray-100"
+              value={langDirection}
+              onChange={(e) => setLangDirection(e.target.value)}
+            >
+              <option value="en-zh">{t.langDirectionEnZh}</option>
+              <option value="zh-en">{t.langDirectionZhEn}</option>
+            </select>
+            <p className="text-xs text-gray-500 dark:text-gray-400 ml-1">{t.langDirectionNotice}</p>
+          </div>
           <div className="space-y-2">
             <label className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider ml-1">{t.sourceText}</label>
             <textarea
               className="w-full h-40 bg-white dark:bg-gray-900/50 border border-gray-200 dark:border-gray-800 rounded-xl p-4 focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 focus:outline-none transition-all resize-none placeholder-gray-400 dark:placeholder-gray-600 text-gray-900 dark:text-gray-100"
-              placeholder={t.sourcePlaceholder}
+              placeholder={langDirection === 'en-zh' ? t.sourcePlaceholderEn : t.sourcePlaceholderZh}
               value={sourceText}
               onChange={(e) => setSourceText(e.target.value)}
             />
+          </div>
+          <div className="flex items-center justify-center -my-1">
+            <button type="button" onClick={handleSwap} className="p-2.5 rounded-xl border border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700 hover:text-gray-900 dark:hover:text-white transition-colors" aria-label={t.swapLabel} title={t.swapLabel}>
+              <ArrowLeftRight className="w-5 h-5" />
+            </button>
           </div>
           <div className="space-y-2">
             <label className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider ml-1">{t.targetTranslation}</label>
             <textarea
               className="w-full h-40 bg-white dark:bg-gray-900/50 border border-gray-200 dark:border-gray-800 rounded-xl p-4 focus:ring-2 focus:ring-green-500/50 focus:border-green-500 focus:outline-none transition-all resize-none placeholder-gray-400 dark:placeholder-gray-600 text-gray-900 dark:text-gray-100"
-              placeholder={t.translationPlaceholder}
+              placeholder={langDirection === 'en-zh' ? t.translationPlaceholderEn : t.translationPlaceholderZh}
               value={targetText}
               onChange={(e) => setTargetText(e.target.value)}
             />
           </div>
+
+          {hasResult && (
+            <div className="space-y-3 rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900/50 p-4">
+              <h3 className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t.visualPreview}</h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="space-y-1.5">
+                  <span className="text-xs font-medium text-gray-500 dark:text-gray-400">{t.sourcePreview}</span>
+                  <div className="min-h-[4rem] p-3 rounded-lg bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 text-gray-900 dark:text-gray-100 whitespace-pre-wrap break-words leading-relaxed">
+                    {(() => {
+                      const segments = buildHighlightSegments(sourceText, highlightSourceErrors, highlightSourceTone);
+                      return segments.map((seg, i) =>
+                        typeof seg === 'string' ? (
+                          <React.Fragment key={i}>{seg}</React.Fragment>
+                        ) : (
+                          <mark key={i} className={seg.type === 'error' ? 'bg-red-500/30 rounded px-0.5' : 'bg-yellow-500/30 rounded px-0.5'}>
+                            {seg.text}
+                          </mark>
+                        )
+                      );
+                    })()}
+                  </div>
+                </div>
+                <div className="space-y-1.5">
+                  <span className="text-xs font-medium text-gray-500 dark:text-gray-400">{t.targetPreview}</span>
+                  <div className="min-h-[4rem] p-3 rounded-lg bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 text-gray-900 dark:text-gray-100 whitespace-pre-wrap break-words leading-relaxed">
+                    {(() => {
+                      const segments = buildHighlightSegments(targetText, highlightTargetErrors, highlightTargetTone);
+                      return segments.map((seg, i) =>
+                        typeof seg === 'string' ? (
+                          <React.Fragment key={i}>{seg}</React.Fragment>
+                        ) : (
+                          <mark key={i} className={seg.type === 'error' ? 'bg-red-500/30 rounded px-0.5' : 'bg-yellow-500/30 rounded px-0.5'}>
+                            {seg.text}
+                          </mark>
+                        )
+                      );
+                    })()}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="flex flex-col gap-6">
@@ -589,6 +844,19 @@ Suggestions: ... (only if needed; omit if no changes suggested)`,
                 placeholder={t.apiKeyPlaceholder}
               />
               <p className="text-xs text-gray-500 dark:text-gray-600">{t.apiKeyHint}</p>
+            </div>
+
+            <div className="mb-6 space-y-3 rounded-lg border border-amber-200 dark:border-amber-800/50 bg-amber-50/50 dark:bg-amber-950/20 p-3">
+              <p className="text-xs text-amber-700 dark:text-amber-400">{t.personaCacheWarning}</p>
+              <div className="flex flex-wrap gap-2">
+                <button type="button" onClick={handleExportPersonas} className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
+                  <Download className="w-3.5 h-3.5" /> {t.exportPersonas}
+                </button>
+                <input ref={importPersonasInputRef} type="file" accept=".json,application/json" className="hidden" onChange={handleImportPersonas} aria-hidden="true" />
+                <button type="button" onClick={() => importPersonasInputRef.current?.click()} className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
+                  <Upload className="w-3.5 h-3.5" /> {t.importPersonas}
+                </button>
+              </div>
             </div>
 
             <div className="flex justify-end gap-3">
